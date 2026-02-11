@@ -1,0 +1,370 @@
+# -*- coding: utf-8 -*-
+import os, time, json
+import argparse
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from .utils import ensure_dir, save_json, rank0_print, set_seed, now_str, open_text
+from .data import (
+    build_gene2id_with_support,
+    build_split_map_gene_7_2_1,
+    JsonlIterable,
+    collate_fn_factory,
+)
+from .model import HFChunkEncoder, ReadClassifierAttn, ReadClassifierGatedAttn
+from .train import (
+    train_one_epoch_frozen_base,
+    eval_one_epoch,
+    save_confusion_artifacts,
+    save_attention_artifacts,
+)
+
+
+def attn_stats_to_wandb(attn_stats: dict, prefix: str = "attn/") -> dict:
+    """Convert attention diagnostics (attn_stats) into flat scalar metrics for Weights & Biases.
+
+    Expected keys from train.eval_one_epoch():
+      - n_reads: scalar tensor
+      - sum_entropy: scalar tensor
+      - topm_list: list[int]
+      - sum_topm_mass: tensor (M,)
+    """
+    if not attn_stats:
+        return {}
+    if ("n_reads" not in attn_stats) or ("sum_topm_mass" not in attn_stats):
+        return {}
+
+    n_reads = float(attn_stats["n_reads"].item())
+    if n_reads <= 0:
+        return {}
+
+    out = {}
+
+    # mean entropy
+    if "sum_entropy" in attn_stats:
+        out[f"{prefix}mean_entropy"] = float(attn_stats["sum_entropy"].item()) / max(n_reads, 1.0)
+
+    # mean top-m cumulative mass
+    topm_list = attn_stats.get("topm_list", [])
+    sum_topm_mass = attn_stats["sum_topm_mass"].detach().float().cpu().numpy()
+    mean_topm_mass = (sum_topm_mass / max(n_reads, 1.0)).tolist()
+
+    for m, v in zip(topm_list, mean_topm_mass):
+        out[f"{prefix}top{int(m)}_mass_mean"] = float(v)
+
+    return out
+
+
+def compute_class_weight(data_paths, gene2id, split_map, num_classes, device):
+    freq = np.zeros((num_classes,), dtype=np.int64)
+    for p in data_paths:
+        with open_text(p) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                g = obj.get("gene_id", None)
+                rid = obj.get("id", None)
+                if g in gene2id and rid in split_map and split_map[rid] == "train":
+                    freq[gene2id[g]] += 1
+    w = 1.0 / np.sqrt(np.maximum(freq, 1))
+    w = w / w.mean()
+    return torch.tensor(w, dtype=torch.float32, device=device)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--data", type=str, nargs="+", required=True, help="jsonl(.gz) path(s)")
+    ap.add_argument("--model_path", type=str, required=True, help="HF base model path")
+    ap.add_argument("--outdir", type=str, required=True)
+
+    ap.add_argument("--num_classes", type=int, default=50)
+    ap.add_argument("--reads_per_gene", type=int, default=100)
+    ap.add_argument("--split_salt", type=str, default="0")
+
+    ap.add_argument("--vocab_size", type=int, default=None)
+    ap.add_argument("--pad_id", type=int, default=None)
+    ap.add_argument("--hidden_layer",type=int,default=-1,help="Which backbone hidden layer to use for pooling (-1 last, -2 second last, ...).",)
+    ap.add_argument("--text_field", type=str, default="txt")
+    ap.add_argument("--model_type", type=str, default="auto", choices=["auto", "rnaernie"])
+    ap.add_argument("--add_special_tokens", action=argparse.BooleanOptionalAction, default=None)
+
+
+    ap.add_argument("--chunk_len", type=int, default=64)
+    ap.add_argument("--stride", type=int, default=48)
+    ap.add_argument("--K_chunks", type=int, default=64)
+
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=4)
+
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=1e-2)
+    ap.add_argument("--label_smoothing", type=float, default=0.05)
+    ap.add_argument("--use_class_weight", action="store_true")
+
+    ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--seed", type=int, default=42)
+
+    ap.add_argument("--head_type", type=str, default="single", choices=["single", "gated"])
+    ap.add_argument("--gated_hidden", type=int, default=128)
+    ap.add_argument("--gated_attn_dropout", type=float, default=0.1)
+    ap.add_argument("--gated_temperature", type=float, default=1.0)
+
+    ap.add_argument("--save_attn", action="store_true")
+    ap.add_argument("--attn_max_samples", type=int, default=64)
+
+    ap.add_argument("--write_split_map_only", action="store_true")
+
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--wandb_project", type=str, default="nanopore-gene-class")
+    ap.add_argument("--wandb_name", type=str, default="")
+    ap.add_argument("--wandb_tags", type=str, default="")
+    ap.add_argument("--wandb_offline", action="store_true")
+
+    args = ap.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    set_seed(args.seed)
+
+    ensure_dir(args.outdir)
+    rank0_print(f"[INFO] device={device} outdir={args.outdir}")
+    rank0_print(f"[INFO] reads_per_gene={args.reads_per_gene} split_salt={args.split_salt} head_type={args.head_type}")
+    rank0_print(f"[INFO] K={args.K_chunks} L={args.chunk_len} stride={args.stride} batch_size(reads)={args.batch_size}")
+
+    # gene mapping
+    gene2id, sel_counts = build_gene2id_with_support(args.data, args.num_classes, args.reads_per_gene)
+    if len(gene2id) == 0:
+        raise RuntimeError(f"No genes have >= {args.reads_per_gene} reads. Lower --reads_per_gene or check data.")
+    args.num_classes = len(gene2id)
+
+    id2gene = {str(v): k for k, v in gene2id.items()}
+    save_json(os.path.join(args.outdir, "gene2id.json"), gene2id)
+    save_json(os.path.join(args.outdir, "id2gene.json"), id2gene)
+    save_json(os.path.join(args.outdir, "selected_gene_counts.json"), sel_counts)
+    rank0_print(f"[INFO] eligible classes={args.num_classes}")
+
+    # split map 7:2:1 per gene + deterministic subsample
+    split_map, sampled = build_split_map_gene_7_2_1(
+        args.data, gene2id, args.reads_per_gene, args.split_salt, 70, 20, 10
+    )
+    save_json(os.path.join(args.outdir, f"split_map_7_2_1_reads{args.reads_per_gene}_salt{args.split_salt}.json"), split_map)
+    save_json(os.path.join(args.outdir, f"sampled_rids_by_gene_reads{args.reads_per_gene}_salt{args.split_salt}.json"), sampled)
+
+    if args.write_split_map_only:
+        rank0_print("[INFO] --write_split_map_only set; exiting.")
+        return
+
+    if args.model_type == "rnaernie":
+        from multimolecule import RnaTokenizer
+
+        tokenizer = RnaTokenizer.from_pretrained(args.model_path)
+    else:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+
+    tokenizer.model_max_length = int(1e9)
+
+    add_special_tokens = args.add_special_tokens
+    if add_special_tokens is None:
+        add_special_tokens = args.model_type == "rnaernie"
+
+    vocab_size = args.vocab_size if args.vocab_size is not None else tokenizer.vocab_size
+    pad_id = args.pad_id if args.pad_id is not None else tokenizer.pad_token_id
+    if pad_id is None:
+        raise ValueError("pad_id is required; pass --pad_id or use a tokenizer with pad_token_id.")
+
+    train_ds = JsonlIterable(
+        args.data,
+        gene2id,
+        split="train",
+        split_map=split_map,
+        vocab_size=vocab_size,
+        text_field=args.text_field,
+        tokenizer=tokenizer,
+        add_special_tokens=add_special_tokens,
+    )
+    val_ds = JsonlIterable(
+        args.data,
+        gene2id,
+        split="val",
+        split_map=split_map,
+        vocab_size=vocab_size,
+        text_field=args.text_field,
+        tokenizer=tokenizer,
+        add_special_tokens=add_special_tokens,
+    )
+    test_ds = JsonlIterable(
+        args.data,
+        gene2id,
+        split="test",
+        split_map=split_map,
+        vocab_size=vocab_size,
+        text_field=args.text_field,
+        tokenizer=tokenizer,
+        add_special_tokens=add_special_tokens,
+    )
+
+    collate_fn = collate_fn_factory(args.chunk_len, args.stride, args.K_chunks, pad_id)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=False,
+    )
+
+    base = HFChunkEncoder(
+        model_path=args.model_path,
+        vocab_size=vocab_size,
+        pad_id=pad_id,
+        out_dim=256,
+        hidden_layer=args.hidden_layer,  # ✅ 新增
+        model_type=args.model_type,
+    ).to(device)
+
+    for p in base.parameters():
+        p.requires_grad = False
+    base.eval()
+
+    if args.head_type == "single":
+        head = ReadClassifierAttn(dim=256, num_classes=args.num_classes, dropout=0.1).to(device)
+    else:
+        head = ReadClassifierGatedAttn(
+            dim=256,
+            num_classes=args.num_classes,
+            hidden_attn=args.gated_hidden,
+            dropout=0.1,
+            attn_dropout=args.gated_attn_dropout,
+            temperature=args.gated_temperature,
+        ).to(device)
+
+    class_weight = None
+    if args.use_class_weight:
+        class_weight = compute_class_weight(args.data, gene2id, split_map, args.num_classes, device)
+
+    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    wb = None
+    if args.wandb:
+        import wandb
+        if args.wandb_offline:
+            os.environ["WANDB_MODE"] = "offline"
+        run_name = args.wandb_name or f"class_{args.head_type}_{os.path.basename(args.model_path)}_{now_str()}_salt{args.split_salt}"
+        tags = [t for t in args.wandb_tags.split(",") if t.strip()] if args.wandb_tags else []
+        wb = wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            tags=tags,
+            config=vars(args),
+        )
+
+    best_top1 = -1.0
+    best_path = os.path.join(args.outdir, "best.pt")
+
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+
+        tr_loss, tr_top1, tr_top5 = train_one_epoch_frozen_base(
+            base=base,
+            head=head,
+            loader=train_loader,
+            opt=opt,
+            device=device,
+            amp=args.amp,
+            label_smoothing=args.label_smoothing,
+            class_weight=class_weight,
+        )
+
+        val_loss, val_top1, val_top5, cm, attn_stats = eval_one_epoch(
+            base=base,
+            head=head,
+            loader=val_loader,
+            device=device,
+            amp=args.amp,
+            num_classes=args.num_classes,
+            collect_attn=args.save_attn,
+            attn_max_samples=args.attn_max_samples,
+        )
+
+        dt = time.time() - t0
+
+        msg = (f"[E{epoch:03d}][freeze_base_{args.head_type}] "
+               f"train loss={tr_loss:.4f} top1={tr_top1:.4f} top5={tr_top5:.4f} | "
+               f"val loss={val_loss:.4f} top1={val_top1:.4f} top5={val_top5:.4f} | time={dt:.1f}s")
+        rank0_print(msg)
+
+        if wb is not None:
+            log_obj = {
+                "epoch": epoch,
+                "train/loss": tr_loss, "train/top1": tr_top1, "train/top5": tr_top5,
+                "val/loss": val_loss, "val/top1": val_top1, "val/top5": val_top5,
+                "time/epoch_sec": dt,
+            }
+            if args.save_attn:
+                log_obj.update(attn_stats_to_wandb(attn_stats, prefix="attn/"))
+            wb.log(log_obj)
+
+        save_confusion_artifacts(args.outdir, cm, id2gene, prefix=f"val_e{epoch:03d}")
+        if args.save_attn:
+            save_attention_artifacts(args.outdir, attn_stats, prefix=f"val_e{epoch:03d}")
+
+        if val_top1 > best_top1:
+            best_top1 = val_top1
+            torch.save(
+                {"epoch": epoch, "best_val_top1": best_top1, "args": vars(args), "head_state_dict": head.state_dict()},
+                best_path,
+            )
+            rank0_print(f"[SAVE] {best_path}  val_top1={best_top1:.4f}")
+
+    # final test with best head
+    if os.path.isfile(best_path):
+        ckpt = torch.load(best_path, map_location="cpu")
+        head.load_state_dict(ckpt["head_state_dict"], strict=True)
+
+    test_loss, test_top1, test_top5, cm_test, attn_test = eval_one_epoch(
+        base, head, test_loader, device, args.amp,
+        num_classes=args.num_classes,
+        collect_attn=args.save_attn,
+        attn_max_samples=args.attn_max_samples,
+    )
+    rank0_print(f"[TEST] loss={test_loss:.4f} top1={test_top1:.4f} top5={test_top5:.4f}")
+
+    save_confusion_artifacts(args.outdir, cm_test, id2gene, prefix="test_best")
+    if args.save_attn:
+        save_attention_artifacts(args.outdir, attn_test, prefix="test_best")
+
+    if wb is not None:
+        test_log = {"test/loss": test_loss, "test/top1": test_top1, "test/top5": test_top5}
+        if args.save_attn:
+            test_log.update(attn_stats_to_wandb(attn_test, prefix="test_attn/"))
+        wb.log(test_log)
+        wb.finish()
+
+
+if __name__ == "__main__":
+    main()
