@@ -99,7 +99,6 @@ def main():
     ap.add_argument("--hidden_layer", type=int, default=-1,
                     help="Which backbone hidden layer to use for pooling (-1 last, -2 second last, ...).")
     ap.add_argument("--text_field", type=str, default="text")
-    ap.add_argument("--model_type", type=str, default="auto", choices=["auto", "rnaernie"])
     ap.add_argument("--add_special_tokens", action=argparse.BooleanOptionalAction, default=None)
 
     ap.add_argument("--chunk_len", type=int, default=64)
@@ -180,18 +179,14 @@ def main():
         rank0_print("[INFO] --write_split_map_only set; exiting.")
         return
 
-    if args.model_type == "rnaernie":
-        from multimolecule import RnaTokenizer
-        tokenizer = RnaTokenizer.from_pretrained(args.model_path)
-    else:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     tokenizer.model_max_length = int(1e9)
 
     add_special_tokens = args.add_special_tokens
     if add_special_tokens is None:
-        add_special_tokens = args.model_type == "rnaernie"
+        add_special_tokens = False
 
     vocab_size = args.vocab_size if args.vocab_size is not None else tokenizer.vocab_size
     pad_id = args.pad_id if args.pad_id is not None else tokenizer.pad_token_id
@@ -247,7 +242,6 @@ def main():
         pad_id=pad_id,
         out_dim=256,
         hidden_layer=args.hidden_layer,
-        model_type=args.model_type,
     ).to(device)
 
     for p in base.parameters():

@@ -74,16 +74,6 @@ python -m dccls.main \
   --epochs 30
 ```
 
-如果使用 RNAErnie：
-
-```bash
-python -m dccls.main \
-  --data_root /path/to/data_root \
-  --model_path /path/to/rnaernie \
-  --model_type rnaernie \
-  --outdir /path/to/output
-```
-
 ---
 
 ## 4. 输出文件
@@ -111,7 +101,6 @@ python -m dccls.main \
 
 可选：
 
-- `multimolecule`（当 `--model_type rnaernie` 时）
 - `wandb`（当 `--wandb` 时）
 
 ---

@@ -10,7 +10,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from multimolecule import RnaErnieModel
 from transformers import AutoModel
 
 
@@ -32,19 +31,15 @@ class HFChunkEncoder(nn.Module):
         pad_id: int,
         out_dim: int = 256,
         hidden_layer: int = -1,  # ✅ 新增：选择用哪一层（-1/-2/-3...）
-        model_type: str = "auto",
     ):
         super().__init__()
         self.pad_id = int(pad_id)
         self.hidden_layer = int(hidden_layer)
 
-        if model_type == "rnaernie":
-            self.model = RnaErnieModel.from_pretrained(model_path)
-        else:
-            self.model = AutoModel.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-            )
+        self.model = AutoModel.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
 
         emb = self.model.get_input_embeddings()
         if emb is not None and vocab_size is not None and emb.num_embeddings < int(vocab_size):

@@ -41,7 +41,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 
-from multimolecule import RnaErnieModel, RnaTokenizer
 from transformers import AutoModel, AutoTokenizer
 
 
@@ -274,19 +273,15 @@ class HFChunkEncoder(nn.Module):
         pad_id: int,
         out_dim: int = 256,
         hidden_layer: int = -1,
-        model_type: str = "auto",
     ):
         super().__init__()
         self.pad_id = int(pad_id)
         self.hidden_layer = int(hidden_layer)
 
-        if model_type == "rnaernie":
-            self.model = RnaErnieModel.from_pretrained(model_path)
-        else:
-            self.model = AutoModel.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-            )
+        self.model = AutoModel.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
 
         emb = self.model.get_input_embeddings()
         if emb is not None and emb.num_embeddings < vocab_size:
@@ -589,7 +584,6 @@ def main():
     ap.add_argument("--pad_id", type=int, default=None)
     ap.add_argument("--hidden_layer", type=int, default=-1)
     ap.add_argument("--text_field", type=str, default="txt")
-    ap.add_argument("--model_type", type=str, default="auto", choices=["auto", "rnaernie"])
     ap.add_argument("--add_special_tokens", action=argparse.BooleanOptionalAction, default=None)
     ap.add_argument("--chunk_len", type=int, default=64)
     ap.add_argument("--stride", type=int, default=48)
@@ -655,16 +649,13 @@ def main():
     ckpt = torch.load(ckpt_path, map_location="cpu")
     head_state = ckpt.get("head_state_dict", ckpt)
 
-    if args.model_type == "rnaernie":
-        tokenizer = RnaTokenizer.from_pretrained(args.model_path)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     tokenizer.model_max_length = int(1e9)
 
     add_special_tokens = args.add_special_tokens
     if add_special_tokens is None:
-        add_special_tokens = args.model_type == "rnaernie"
+        add_special_tokens = False
 
     vocab_size = args.vocab_size if args.vocab_size is not None else tokenizer.vocab_size
     pad_id = args.pad_id if args.pad_id is not None else tokenizer.pad_token_id
@@ -677,7 +668,6 @@ def main():
         pad_id=pad_id,
         out_dim=256,
         hidden_layer=args.hidden_layer,
-        model_type=args.model_type,
     ).to(device)
     for p in base.parameters():
         p.requires_grad = False
