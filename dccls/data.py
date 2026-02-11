@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-import json, re
-from typing import Dict, List, Tuple, Optional
+import json, re, os
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import torch
@@ -18,6 +18,19 @@ def parse_token_ids(text: str, vocab_size: Optional[int]) -> List[int]:
     return ids
 
 
+def normalize_text(value: Any) -> str:
+    """Normalize text field from either a string or a list of tokens into one string."""
+    if isinstance(value, list):
+        return " ".join(str(x) for x in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def infer_class_from_path(path: str, path_class_map: Dict[str, str]) -> Optional[str]:
+    return path_class_map.get(os.path.abspath(path))
+
+
 def encode_text(
     text: str,
     vocab_size: Optional[int],
@@ -33,15 +46,22 @@ def encode_text(
     return ids
 
 
-def build_gene2id_with_support(paths: List[str], num_classes: int, reads_per_gene: int):
+def build_class2id_with_support(
+    paths: List[str],
+    reads_per_class: int,
+    path_class_map: Dict[str, str],
+):
     """
-    Count gene frequency, keep genes with >= reads_per_gene, pick top num_classes among them.
+    Count per-class samples and keep classes with at least 1 sample.
     Return:
-      gene2id: {gene -> class_id}
-      selected_counts: {gene -> count}
+      class2id: {class_name -> class_id}
+      selected_counts: {class_name -> count}
     """
-    counts = {}
+    counts: Dict[str, int] = {}
     for p in paths:
+        cls = infer_class_from_path(p, path_class_map)
+        if cls is None:
+            continue
         with open_text(p) as f:
             for line in f:
                 if not line.strip():
@@ -50,39 +70,41 @@ def build_gene2id_with_support(paths: List[str], num_classes: int, reads_per_gen
                     obj = json.loads(line)
                 except Exception:
                     continue
-                g = obj.get("gene_id", None)
-                if g is None:
+                if obj.get("id", None) is None:
                     continue
-                counts[g] = counts.get(g, 0) + 1
+                counts[cls] = counts.get(cls, 0) + 1
 
-    eligible = [(g, c) for g, c in counts.items() if c >= reads_per_gene]
-    eligible.sort(key=lambda x: x[1], reverse=True)
-    eligible = eligible[:num_classes]
+    eligible = [(c, n) for c, n in counts.items() if n > 0]
+    eligible.sort(key=lambda x: x[0])
 
-    gene2id = {g: i for i, (g, _) in enumerate(eligible)}
-    selected_counts = {g: int(c) for g, c in eligible}
-    return gene2id, selected_counts
+    class2id = {c: i for i, (c, _) in enumerate(eligible)}
+    selected_counts = {c: int(n) for c, n in eligible}
+    return class2id, selected_counts
 
 
-def build_split_map_gene_7_2_1(
+def build_split_map_class_7_2_1(
     paths: List[str],
-    gene2id: Dict[str, int],
-    reads_per_gene: int,
+    class2id: Dict[str, int],
+    reads_per_class: int,
     split_salt: str,
+    path_class_map: Dict[str, str],
     pct_train: int = 70,
     pct_val: int = 20,
     pct_test: int = 10,
 ):
     """
-    Deterministic per-gene subsampling (exact reads_per_gene) + deterministic 7:2:1 split.
+    Deterministic per-class subsampling + deterministic 7:2:1 split.
 
     Return:
       split_map: {rid: "train"/"val"/"test"}
-      sampled_rids_by_gene: {gene: [rid,...]}  (length == reads_per_gene if possible)
+      sampled_rids_by_class: {class_name: [rid,...]}
     """
-    gene_to_rids: Dict[str, List[str]] = {g: [] for g in gene2id.keys()}
+    class_to_rids: Dict[str, List[str]] = {c: [] for c in class2id.keys()}
 
     for p in paths:
+        cls = infer_class_from_path(p, path_class_map)
+        if cls is None or cls not in class_to_rids:
+            continue
         with open_text(p) as f:
             for line in f:
                 if not line.strip():
@@ -92,27 +114,23 @@ def build_split_map_gene_7_2_1(
                 except Exception:
                     continue
                 rid = obj.get("id", None)
-                gene = obj.get("gene_id", None)
-                if rid is None or gene is None:
+                if rid is None:
                     continue
-                if gene not in gene_to_rids:
-                    continue
-                gene_to_rids[gene].append(rid)
+                class_to_rids[cls].append(rid)
 
     split_map: Dict[str, str] = {}
     sampled: Dict[str, List[str]] = {}
 
-    for gene, rids in gene_to_rids.items():
+    for cls, rids in class_to_rids.items():
         if len(rids) == 0:
             continue
 
         keyed = [(stable_hash_u32(f"{rid}|{split_salt}"), rid) for rid in rids]
         keyed.sort(key=lambda x: x[0])
 
-        # subsample exactly reads_per_gene if possible
-        take = min(reads_per_gene, len(keyed))
+        take = min(reads_per_class, len(keyed))
         sel = [rid for _, rid in keyed[:take]]
-        sampled[gene] = sel
+        sampled[cls] = sel
 
         n = len(sel)
         n_tr = int(round(n * (pct_train / 100.0)))
@@ -146,10 +164,11 @@ class JsonlIterable(IterableDataset):
     def __init__(
         self,
         paths: List[str],
-        gene2id: Dict[str, int],
+        class2id: Dict[str, int],
         split: str,
         split_map: Dict[str, str],
         vocab_size: int,
+        path_class_map: Dict[str, str],
         text_field: str = "text",
         tokenizer=None,
         add_special_tokens: bool = False,
@@ -158,16 +177,21 @@ class JsonlIterable(IterableDataset):
         super().__init__()
         assert split in ("train", "val", "test")
         self.paths = paths
-        self.gene2id = gene2id
+        self.class2id = class2id
         self.split = split
         self.split_map = split_map
         self.vocab_size = vocab_size
+        self.path_class_map = path_class_map
         self.text_field = text_field
         self.tokenizer = tokenizer
         self.add_special_tokens = add_special_tokens
         self.max_token_len = max_token_len
 
     def _iter_one_file(self, path: str):
+        cls = infer_class_from_path(path, self.path_class_map)
+        if cls is None or cls not in self.class2id:
+            return
+
         with open_text(path) as f:
             for line in f:
                 if not line.strip():
@@ -178,12 +202,9 @@ class JsonlIterable(IterableDataset):
                     continue
 
                 rid = obj.get("id", None)
-                gene = obj.get("gene_id", None)
-                text = obj.get(self.text_field, "")
+                text = normalize_text(obj.get(self.text_field, ""))
 
-                if rid is None or gene is None:
-                    continue
-                if gene not in self.gene2id:
+                if rid is None:
                     continue
 
                 sp = self.split_map.get(rid, None)
@@ -201,7 +222,7 @@ class JsonlIterable(IterableDataset):
                 if len(token_ids) > self.max_token_len:
                     token_ids = token_ids[: self.max_token_len]
 
-                yield rid, token_ids, self.gene2id[gene]
+                yield rid, token_ids, self.class2id[cls]
 
     def __iter__(self):
         for p in self.paths:
