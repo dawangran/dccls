@@ -146,6 +146,45 @@ python -m dccls.main \
   --gated_temperature 1.0
 ```
 
+### 4.4 如果想加入对比学习（contrastive learning）
+
+可以加，但**当前仓库这版代码还没有内置对比学习 loss 和对应参数**；如果你要扩展，比较推荐下面这条路线：
+
+1. **保留现有 frozen backbone + MIL head 主流程**
+   - 先继续用当前 `HFChunkEncoder` 提取 chunk embedding；
+   - 再用 attention pooling 得到 read 级 embedding。
+
+2. **在分类 loss 之外，再加一个 read-level contrastive loss**
+   - 正样本对：同一类别的 read；
+   - 负样本对：不同类别的 read；
+   - 常见做法：`InfoNCE`、`SupConLoss`（supervised contrastive loss）。
+
+3. **推荐的联合训练目标**
+   - `loss = cls_loss + lambda_contrast * contrast_loss`
+   - 其中：
+     - `cls_loss` 仍然是现在的交叉熵分类损失；
+     - `contrast_loss` 约束 read embedding 在表征空间里“同类更近、异类更远”；
+     - `lambda_contrast` 用来控制两部分损失的权重。
+
+4. **建议优先在 read embedding 上做，而不是 chunk embedding 上做**
+   - 因为当前任务最终预测单位是 read / 样本；
+   - 用 attention 聚合后的 read 表征做对比学习，通常更直接，也更省显存。
+
+5. **如果你后面真的要落代码，建议新增的参数大概会是**
+   - `--use_contrastive`：是否开启对比学习；
+   - `--contrastive_weight`：对比损失权重；
+   - `--contrastive_temp`：InfoNCE / SupCon 温度；
+   - `--contrastive_mode`：`supcon` / `infonce`；
+   - `--proj_dim`：对比学习投影头维度。
+
+一个比较实用的策略是：
+
+- **阶段 1**：先只跑当前分类训练，确认 baseline 正常；
+- **阶段 2**：加 read-level supervised contrastive loss；
+- **阶段 3**：再比较是否提升 val/test top1、混淆矩阵和类别间可分性。
+
+> 结论：**能加，而且很适合这个项目的 read-level 分类场景**。只是当前 README 里需要明确：这属于“推荐扩展方案”，不是仓库已经实现好的现成功能。
+
 ---
 
 ## 5. 所有参数说明
@@ -596,6 +635,18 @@ python -m dccls.main \
 - `chunk_len`：每个小片段有多长；
 - `stride`：两个小片段之间隔多远开始切；
 - `K_chunks`：每条 read 最多保留多少个小片段给分类头。
+
+### Q8: 想加对比学习，可以怎么做？
+可以，比较推荐加在 **read-level embedding** 上，而不是最底层 chunk 上。
+
+建议思路：
+
+1. 保持当前分类训练不变；
+2. 取 attention pooling 后的 read embedding；
+3. 叠加 supervised contrastive loss / InfoNCE；
+4. 用 `分类损失 + 对比损失` 联合训练。
+
+如果后续真的实现，建议把它做成可选开关，而不是替代当前分类主流程。
 
 ---
 
