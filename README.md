@@ -64,6 +64,7 @@ data_root/
 - 新增 `--min_text_length` 控制最短文本长度过滤。
 - 新增 `--warmup_ratio` 控制学习率 warmup 比例。
 - 新增 `--unfreeze_last_n_layers`，用于选择“完全冻结基座”或“解冻最后 N 层”。
+- 新增 `--supcon_weight` / `--supcon_temperature`，用于在 read embedding 上叠加 supervised contrastive loss。
 
 下面是 `python -m dccls.main` 的主要参数说明。
 
@@ -203,6 +204,23 @@ data_root/
 - 含义：是否根据训练集类别频次启用 class weight。
 - 适用场景：类别不均衡时建议尝试打开。
 
+#### `--supcon_weight`
+- 类型：`float`
+- 默认值：`0.0`
+- 含义：read embedding 上 supervised contrastive loss 的权重。
+- 说明：
+  - 设为 `0.0` 时，行为与原始纯分类训练一致。
+  - 可以从 `0.05`、`0.1`、`0.2` 开始尝试。
+  - backbone 冻结时，SupCon 只会更新 MIL 头；如果解冻最后几层，SupCon 梯度也会传到这些已解冻的 backbone 参数。
+
+#### `--supcon_temperature`
+- 类型：`float`
+- 默认值：`0.1`
+- 含义：supervised contrastive loss 的温度系数。
+- 说明：
+  - 必须大于 `0`。
+  - 常见起点可以是 `0.07` 或 `0.1`。
+
 #### `--amp`
 - 类型：布尔开关
 - 默认值：关闭
@@ -234,6 +252,7 @@ data_root/
   - `0`：完全冻结基座，只训练分类头。
   - `N > 0`：解冻 backbone 的最后 `N` 个 transformer block，并同时解冻输出投影层/归一化层。
   - 如果传入值大于 backbone 实际层数，则会自动退化为“解冻全部可识别的最后层”。
+  - 实战建议先从 `0` 开始，只在验证集上限不足时再尝试 `1` 或 `2`。
 
 #### `--head_type`
 - 类型：`str`
@@ -334,7 +353,10 @@ python -m dccls.main \
   --epochs 30 \
   --lr 2e-4 \
   --warmup_ratio 0.1 \
-  --unfreeze_last_n_layers 2
+  --unfreeze_last_n_layers 2 \
+  --head_type gated \
+  --supcon_weight 0.1 \
+  --supcon_temperature 0.1
 ```
 
 ### 3.3 只生成划分文件
@@ -412,3 +434,9 @@ python -m dccls.main \
 - 如果想保持原来行为，直接使用默认值 `--unfreeze_last_n_layers 0`。
 - 如果想做轻量微调，可以尝试 `--unfreeze_last_n_layers 1`、`2` 或 `4`。
 - 一般来说，解冻层数越多，显存占用和训练不稳定性也会更高。
+- 更推荐的顺序是：先跑“冻结 backbone + MIL(+SupCon)”基线，再看是否需要解冻最后 `1~2` 层抬高上限。
+
+### Q7：什么时候建议打开 supervised contrastive loss？
+- 如果你希望 read embedding 的类内更紧、类间更分开，可以尝试打开 `--supcon_weight`。
+- 推荐先保留 MIL 头，再用较小权重（如 `0.05` 或 `0.1`）叠加。
+- 如果 batch 太小且同类样本在同一 batch 中很少，SupCon 的收益可能会不稳定。

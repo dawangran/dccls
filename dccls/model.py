@@ -203,7 +203,13 @@ class ReadClassifierAttn(nn.Module):
             nn.Linear(dim, num_classes),
         )
 
-    def forward(self, ems: torch.Tensor, chunk_mask: torch.Tensor, return_attn: bool = False):
+    def forward(
+        self,
+        ems: torch.Tensor,
+        chunk_mask: torch.Tensor,
+        return_attn: bool = False,
+        return_read_emb: bool = False,
+    ):
         chunk_mask = chunk_mask.bool()
         x = self.pre(ems)                   # (B,K,D)
         scores = self.gate(x).squeeze(-1)   # (B,K)
@@ -214,8 +220,12 @@ class ReadClassifierAttn(nn.Module):
 
         read_emb = torch.einsum("bk,bkd->bd", attn, x)  # (B,D)
         logits = self.head(read_emb)                   # (B,C)
+        if return_attn and return_read_emb:
+            return logits, attn, read_emb
         if return_attn:
             return logits, attn
+        if return_read_emb:
+            return logits, read_emb
         return logits
 
 
@@ -262,7 +272,13 @@ class ReadClassifierGatedAttn(nn.Module):
             nn.Linear(dim, num_classes),
         )
 
-    def forward(self, ems: torch.Tensor, chunk_mask: torch.Tensor, return_attn: bool = False):
+    def forward(
+        self,
+        ems: torch.Tensor,
+        chunk_mask: torch.Tensor,
+        return_attn: bool = False,
+        return_read_emb: bool = False,
+    ):
         chunk_mask = chunk_mask.bool()
         x = self.pre(ems)  # (B,K,D)
 
@@ -285,6 +301,10 @@ class ReadClassifierGatedAttn(nn.Module):
 
         read_emb = torch.einsum("bk,bkd->bd", attn, x)  # (B,D)
         logits = self.head(read_emb)                    # (B,C)
+        if return_attn and return_read_emb:
+            return logits, attn, read_emb
         if return_attn:
             return logits, attn
+        if return_read_emb:
+            return logits, read_emb
         return logits

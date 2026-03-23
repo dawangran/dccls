@@ -180,6 +180,40 @@ def save_confusion_artifacts(outdir: str, cm: np.ndarray, id2gene: Dict[str, str
 
 # ---------- train / eval ----------
 
+def supervised_contrastive_loss(
+    emb: torch.Tensor,
+    y: torch.Tensor,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    if emb.ndim != 2:
+        raise ValueError(f"Expected emb to have shape (B, D), got {tuple(emb.shape)}")
+    if y.ndim != 1:
+        raise ValueError(f"Expected y to have shape (B,), got {tuple(y.shape)}")
+
+    batch_size = emb.size(0)
+    if batch_size <= 1:
+        return emb.new_zeros(())
+
+    z = F.normalize(emb, p=2, dim=1)
+    logits = torch.matmul(z, z.t()) / max(float(temperature), 1e-6)
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+    eye = torch.eye(batch_size, dtype=torch.bool, device=emb.device)
+    pos_mask = y.unsqueeze(0).eq(y.unsqueeze(1)) & ~eye
+
+    if not torch.any(pos_mask):
+        return emb.new_zeros(())
+
+    exp_logits = torch.exp(logits) * (~eye).to(logits.dtype)
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True).clamp(min=1e-12))
+
+    pos_counts = pos_mask.sum(dim=1)
+    valid = pos_counts > 0
+    mean_log_prob_pos = (log_prob * pos_mask.to(log_prob.dtype)).sum(dim=1) / pos_counts.clamp(min=1)
+
+    loss = -mean_log_prob_pos[valid].mean()
+    return loss
+
 def train_one_epoch_frozen_base(
     base: nn.Module,
     head: nn.Module,
@@ -189,6 +223,8 @@ def train_one_epoch_frozen_base(
     amp: bool,
     label_smoothing: float,
     class_weight: Optional[torch.Tensor],
+    supcon_weight: float = 0.0,
+    supcon_temperature: float = 0.1,
     scheduler = None,
 ):
     train_base = any(p.requires_grad for p in base.parameters())
@@ -221,12 +257,20 @@ def train_one_epoch_frozen_base(
                     with torch.no_grad():
                         em = base(flat)
                 ems = em.view(B, K, -1)
-                logits = head(ems, chunk_mask)
-                loss = F.cross_entropy(
+                if supcon_weight > 0.0:
+                    logits, read_emb = head(ems, chunk_mask, return_read_emb=True)
+                else:
+                    logits = head(ems, chunk_mask)
+                    read_emb = None
+                cls_loss = F.cross_entropy(
                     logits, y,
                     weight=class_weight,
                     label_smoothing=label_smoothing
                 )
+                supcon_loss = supervised_contrastive_loss(
+                    read_emb, y, temperature=supcon_temperature
+                ) if read_emb is not None else cls_loss.new_zeros(())
+                loss = cls_loss + supcon_weight * supcon_loss
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
@@ -239,12 +283,20 @@ def train_one_epoch_frozen_base(
                 with torch.no_grad():
                     em = base(flat)
             ems = em.view(B, K, -1)
-            logits = head(ems, chunk_mask)
-            loss = F.cross_entropy(
+            if supcon_weight > 0.0:
+                logits, read_emb = head(ems, chunk_mask, return_read_emb=True)
+            else:
+                logits = head(ems, chunk_mask)
+                read_emb = None
+            cls_loss = F.cross_entropy(
                 logits, y,
                 weight=class_weight,
                 label_smoothing=label_smoothing
             )
+            supcon_loss = supervised_contrastive_loss(
+                read_emb, y, temperature=supcon_temperature
+            ) if read_emb is not None else cls_loss.new_zeros(())
+            loss = cls_loss + supcon_weight * supcon_loss
             loss.backward()
             opt.step()
             if scheduler is not None:
