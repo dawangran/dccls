@@ -23,6 +23,10 @@ from .train import (
 )
 
 
+def count_trainable_params(module: torch.nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+
 def attn_stats_to_wandb(attn_stats: dict, prefix: str = "attn/") -> dict:
     if not attn_stats:
         return {}
@@ -118,6 +122,10 @@ def main():
     ap.add_argument("--warmup_ratio", type=float, default=0.0, help="Linear warmup ratio over total training steps")
     ap.add_argument("--label_smoothing", type=float, default=0.05)
     ap.add_argument("--use_class_weight", action="store_true")
+    ap.add_argument("--supcon_weight", type=float, default=0.0,
+                    help="Weight for supervised contrastive loss on read embeddings")
+    ap.add_argument("--supcon_temperature", type=float, default=0.1,
+                    help="Temperature for supervised contrastive loss")
 
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
@@ -143,6 +151,10 @@ def main():
         raise ValueError("warmup_ratio must be in [0, 1).")
     if args.unfreeze_last_n_layers < 0:
         raise ValueError("unfreeze_last_n_layers must be >= 0.")
+    if args.supcon_weight < 0.0:
+        raise ValueError("supcon_weight must be >= 0.")
+    if args.supcon_temperature <= 0.0:
+        raise ValueError("supcon_temperature must be > 0.")
 
     data_paths, path_class_map = discover_data_from_class_dirs(args.data_root)
     if len(data_paths) == 0:
@@ -155,6 +167,7 @@ def main():
     rank0_print(f"[INFO] device={device} outdir={args.outdir}")
     rank0_print(f"[INFO] reads_per_class={args.reads_per_class} split_salt={args.split_salt} head_type={args.head_type}")
     rank0_print(f"[INFO] K={args.K_chunks} L={args.chunk_len} stride={args.stride} batch_size(reads)={args.batch_size}")
+    rank0_print(f"[INFO] supcon_weight={args.supcon_weight} supcon_temperature={args.supcon_temperature}")
 
     class2id, sel_counts = build_class2id_with_support(
         data_paths,
@@ -261,11 +274,15 @@ def main():
     ).to(device)
 
     actual_unfrozen = configure_backbone_trainability(base, args.unfreeze_last_n_layers)
+    base_trainable = count_trainable_params(base)
     if actual_unfrozen == 0:
         base.eval()
-        rank0_print("[INFO] backbone mode=frozen")
+        rank0_print(f"[INFO] backbone mode=frozen trainable_params={base_trainable}")
     else:
-        rank0_print(f"[INFO] backbone mode=partial_unfreeze unfrozen_last_n_layers={actual_unfrozen}")
+        rank0_print(
+            f"[INFO] backbone mode=partial_unfreeze "
+            f"unfrozen_last_n_layers={actual_unfrozen} trainable_params={base_trainable}"
+        )
 
     if args.head_type == "single":
         head = ReadClassifierAttn(dim=256, num_classes=args.num_classes, dropout=0.1).to(device)
@@ -278,6 +295,7 @@ def main():
             attn_dropout=args.gated_attn_dropout,
             temperature=args.gated_temperature,
         ).to(device)
+    rank0_print(f"[INFO] head trainable_params={count_trainable_params(head)}")
 
     class_weight = None
     if args.use_class_weight:
@@ -287,14 +305,6 @@ def main():
 
     trainable_params = list(head.parameters()) + [p for p in base.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-
-    num_train_samples = sum(1 for sp in split_map.values() if sp == "train")
-    train_steps_per_epoch = max(1, (num_train_samples + max(args.batch_size, 1) - 1) // max(args.batch_size, 1))
-    total_train_steps = max(1, args.epochs * train_steps_per_epoch)
-    warmup_steps = int(total_train_steps * args.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(
-        opt, num_warmup_steps=warmup_steps, num_training_steps=total_train_steps
-    )
 
     num_train_samples = sum(1 for sp in split_map.values() if sp == "train")
     train_steps_per_epoch = max(1, (num_train_samples + max(args.batch_size, 1) - 1) // max(args.batch_size, 1))
@@ -328,6 +338,8 @@ def main():
             amp=args.amp,
             label_smoothing=args.label_smoothing,
             class_weight=class_weight,
+            supcon_weight=args.supcon_weight,
+            supcon_temperature=args.supcon_temperature,
             scheduler=scheduler,
         )
 
