@@ -63,6 +63,7 @@ data_root/
 - 使用 `--reads_per_class` 控制每个类别最多采样多少条数据。
 - 新增 `--min_text_length` 控制最短文本长度过滤。
 - 新增 `--warmup_ratio` 控制学习率 warmup 比例。
+- 新增 `--unfreeze_last_n_layers`，用于选择“完全冻结基座”或“解冻最后 N 层”。
 
 下面是 `python -m dccls.main` 的主要参数说明。
 
@@ -225,6 +226,15 @@ data_root/
   - `-1` 表示最后一层。
   - `-2` 表示倒数第二层。
 
+#### `--unfreeze_last_n_layers`
+- 类型：`int`
+- 默认值：`0`
+- 含义：控制 backbone 的训练方式。
+- 说明：
+  - `0`：完全冻结基座，只训练分类头。
+  - `N > 0`：解冻 backbone 的最后 `N` 个 transformer block，并同时解冻输出投影层/归一化层。
+  - 如果传入值大于 backbone 实际层数，则会自动退化为“解冻全部可识别的最后层”。
+
 #### `--head_type`
 - 类型：`str`
 - 默认值：`single`
@@ -323,7 +333,8 @@ python -m dccls.main \
   --batch_size 8 \
   --epochs 30 \
   --lr 2e-4 \
-  --warmup_ratio 0.1
+  --warmup_ratio 0.1 \
+  --unfreeze_last_n_layers 2
 ```
 
 ### 3.3 只生成划分文件
@@ -396,3 +407,8 @@ python -m dccls.main \
 
 ### Q5：`warmup_ratio` 应该怎么设？
 一般可以从 `0.03`、`0.05` 或 `0.1` 开始尝试；如果训练非常短，可以先保持默认 `0.0`。
+
+### Q6：怎么选择“冻结基座”还是“解冻最后几层”？
+- 如果想保持原来行为，直接使用默认值 `--unfreeze_last_n_layers 0`。
+- 如果想做轻量微调，可以尝试 `--unfreeze_last_n_layers 1`、`2` 或 `4`。
+- 一般来说，解冻层数越多，显存占用和训练不稳定性也会更高。

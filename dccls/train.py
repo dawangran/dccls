@@ -191,7 +191,11 @@ def train_one_epoch_frozen_base(
     class_weight: Optional[torch.Tensor],
     scheduler = None,
 ):
-    base.eval()
+    train_base = any(p.requires_grad for p in base.parameters())
+    if train_base:
+        base.train()
+    else:
+        base.eval()
     head.train()
 
     scaler = torch.amp.GradScaler("cuda") if (amp and device.startswith("cuda")) else None
@@ -211,8 +215,11 @@ def train_one_epoch_frozen_base(
 
         if scaler is not None:
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                with torch.no_grad():
+                if train_base:
                     em = base(flat)
+                else:
+                    with torch.no_grad():
+                        em = base(flat)
                 ems = em.view(B, K, -1)
                 logits = head(ems, chunk_mask)
                 loss = F.cross_entropy(
@@ -226,8 +233,11 @@ def train_one_epoch_frozen_base(
             if scheduler is not None:
                 scheduler.step()
         else:
-            with torch.no_grad():
+            if train_base:
                 em = base(flat)
+            else:
+                with torch.no_grad():
+                    em = base(flat)
             ems = em.view(B, K, -1)
             logits = head(ems, chunk_mask)
             loss = F.cross_entropy(

@@ -13,6 +13,56 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 
+def get_transformer_blocks(model: nn.Module):
+    candidates = (
+        "layers",
+        "h",
+        "encoder.layer",
+        "encoder.layers",
+        "transformer.h",
+        "model.layers",
+    )
+    for path in candidates:
+        cur = model
+        ok = True
+        for part in path.split("."):
+            if not hasattr(cur, part):
+                ok = False
+                break
+            cur = getattr(cur, part)
+        if ok and isinstance(cur, (nn.ModuleList, list, tuple)) and len(cur) > 0:
+            return list(cur)
+    return []
+
+
+def configure_backbone_trainability(base: nn.Module, unfreeze_last_n_layers: int = 0) -> int:
+    for p in base.parameters():
+        p.requires_grad = False
+
+    n = max(0, int(unfreeze_last_n_layers))
+    if n == 0:
+        return 0
+
+    blocks = get_transformer_blocks(base.model)
+    if len(blocks) == 0:
+        raise ValueError("Unable to locate transformer blocks for partial unfreezing on this backbone.")
+
+    actual = min(n, len(blocks))
+    for block in blocks[-actual:]:
+        for p in block.parameters():
+            p.requires_grad = True
+
+    for module in (base.proj, base.ln):
+        for p in module.parameters():
+            p.requires_grad = True
+
+    for attr in ("norm", "ln_f", "final_layernorm", "post_layernorm"):
+        if hasattr(base.model, attr):
+            for p in getattr(base.model, attr).parameters():
+                p.requires_grad = True
+
+    return actual
+
 
 # -*- coding: utf-8 -*-
 class HFChunkEncoder(nn.Module):
