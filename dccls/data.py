@@ -50,6 +50,8 @@ def build_class2id_with_support(
     paths: List[str],
     reads_per_class: int,
     path_class_map: Dict[str, str],
+    text_field: str = "text",
+    min_text_length: int = 0,
 ):
     """
     Count per-class samples and keep classes with at least 1 sample.
@@ -72,6 +74,9 @@ def build_class2id_with_support(
                     continue
                 if obj.get("id", None) is None:
                     continue
+                text = normalize_text(obj.get(text_field, ""))
+                if len(parse_token_ids(text, vocab_size=None)) < min_text_length:
+                    continue
                 counts[cls] = counts.get(cls, 0) + 1
 
     eligible = [(c, n) for c, n in counts.items() if n > 0]
@@ -91,6 +96,8 @@ def build_split_map_class_7_2_1(
     pct_train: int = 70,
     pct_val: int = 20,
     pct_test: int = 10,
+    text_field: str = "text",
+    min_text_length: int = 0,
 ):
     """
     Deterministic per-class subsampling + deterministic 7:2:1 split.
@@ -115,6 +122,9 @@ def build_split_map_class_7_2_1(
                     continue
                 rid = obj.get("id", None)
                 if rid is None:
+                    continue
+                text = normalize_text(obj.get(text_field, ""))
+                if len(parse_token_ids(text, vocab_size=None)) < min_text_length:
                     continue
                 class_to_rids[cls].append(rid)
 
@@ -173,6 +183,7 @@ class JsonlIterable(IterableDataset):
         tokenizer=None,
         add_special_tokens: bool = False,
         max_token_len: int = 200000,
+        min_text_length: int = 0,
     ):
         super().__init__()
         assert split in ("train", "val", "test")
@@ -186,6 +197,7 @@ class JsonlIterable(IterableDataset):
         self.tokenizer = tokenizer
         self.add_special_tokens = add_special_tokens
         self.max_token_len = max_token_len
+        self.min_text_length = min_text_length
 
     def _iter_one_file(self, path: str):
         cls = infer_class_from_path(path, self.path_class_map)
@@ -218,6 +230,8 @@ class JsonlIterable(IterableDataset):
                     add_special_tokens=self.add_special_tokens,
                 )
                 if len(token_ids) == 0:
+                    continue
+                if len(token_ids) < self.min_text_length:
                     continue
                 if len(token_ids) > self.max_token_len:
                     token_ids = token_ids[: self.max_token_len]

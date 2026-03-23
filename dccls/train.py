@@ -189,6 +189,7 @@ def train_one_epoch_frozen_base(
     amp: bool,
     label_smoothing: float,
     class_weight: Optional[torch.Tensor],
+    scheduler = None,
 ):
     base.eval()
     head.train()
@@ -222,6 +223,8 @@ def train_one_epoch_frozen_base(
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
         else:
             with torch.no_grad():
                 em = base(flat)
@@ -234,6 +237,8 @@ def train_one_epoch_frozen_base(
             )
             loss.backward()
             opt.step()
+            if scheduler is not None:
+                scheduler.step()
 
         top1, top5 = topk_acc(logits, y, topk=(1, 5))
         bsz = y.size(0)
