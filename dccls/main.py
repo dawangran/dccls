@@ -5,6 +5,7 @@ import argparse
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from transformers import get_linear_schedule_with_warmup
 
 from .utils import ensure_dir, save_json, rank0_print, set_seed, now_str, open_text
 from .data import (
@@ -13,7 +14,7 @@ from .data import (
     JsonlIterable,
     collate_fn_factory,
 )
-from .model import HFChunkEncoder, ReadClassifierAttn, ReadClassifierGatedAttn
+from .model import HFChunkEncoder, ReadClassifierAttn, ReadClassifierGatedAttn, configure_backbone_trainability
 from .train import (
     train_one_epoch_frozen_base,
     eval_one_epoch,
@@ -98,7 +99,10 @@ def main():
     ap.add_argument("--pad_id", type=int, default=None)
     ap.add_argument("--hidden_layer", type=int, default=-1,
                     help="Which backbone hidden layer to use for pooling (-1 last, -2 second last, ...).")
+    ap.add_argument("--unfreeze_last_n_layers", type=int, default=0,
+                    help="Freeze the full backbone when 0, or unfreeze the last N transformer blocks")
     ap.add_argument("--text_field", type=str, default="text")
+    ap.add_argument("--min_text_length", type=int, default=1000, help="Minimum tokenized text length required to keep a sample")
     ap.add_argument("--add_special_tokens", action=argparse.BooleanOptionalAction, default=None)
 
     ap.add_argument("--chunk_len", type=int, default=64)
@@ -111,6 +115,7 @@ def main():
 
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight_decay", type=float, default=1e-2)
+    ap.add_argument("--warmup_ratio", type=float, default=0.0, help="Linear warmup ratio over total training steps")
     ap.add_argument("--label_smoothing", type=float, default=0.05)
     ap.add_argument("--use_class_weight", action="store_true")
 
@@ -134,6 +139,10 @@ def main():
     ap.add_argument("--wandb_offline", action="store_true")
 
     args = ap.parse_args()
+    if not 0.0 <= args.warmup_ratio < 1.0:
+        raise ValueError("warmup_ratio must be in [0, 1).")
+    if args.unfreeze_last_n_layers < 0:
+        raise ValueError("unfreeze_last_n_layers must be >= 0.")
 
     data_paths, path_class_map = discover_data_from_class_dirs(args.data_root)
     if len(data_paths) == 0:
@@ -151,6 +160,8 @@ def main():
         data_paths,
         args.reads_per_class,
         path_class_map=path_class_map,
+        text_field=args.text_field,
+        min_text_length=args.min_text_length,
     )
     if len(class2id) == 0:
         raise RuntimeError("No valid classes found in data_root subfolders.")
@@ -171,6 +182,8 @@ def main():
         pct_train=70,
         pct_val=20,
         pct_test=10,
+        text_field=args.text_field,
+        min_text_length=args.min_text_length,
     )
     save_json(os.path.join(args.outdir, f"split_map_7_2_1_reads{args.reads_per_class}_salt{args.split_salt}.json"), split_map)
     save_json(os.path.join(args.outdir, f"sampled_rids_by_class_reads{args.reads_per_class}_salt{args.split_salt}.json"), sampled)
@@ -203,6 +216,7 @@ def main():
         text_field=args.text_field,
         tokenizer=tokenizer,
         add_special_tokens=add_special_tokens,
+        min_text_length=args.min_text_length,
     )
     val_ds = JsonlIterable(
         data_paths,
@@ -214,6 +228,7 @@ def main():
         text_field=args.text_field,
         tokenizer=tokenizer,
         add_special_tokens=add_special_tokens,
+        min_text_length=args.min_text_length,
     )
     test_ds = JsonlIterable(
         data_paths,
@@ -225,6 +240,7 @@ def main():
         text_field=args.text_field,
         tokenizer=tokenizer,
         add_special_tokens=add_special_tokens,
+        min_text_length=args.min_text_length,
     )
 
     collate_fn = collate_fn_factory(args.chunk_len, args.stride, args.K_chunks, pad_id)
@@ -244,9 +260,12 @@ def main():
         hidden_layer=args.hidden_layer,
     ).to(device)
 
-    for p in base.parameters():
-        p.requires_grad = False
-    base.eval()
+    actual_unfrozen = configure_backbone_trainability(base, args.unfreeze_last_n_layers)
+    if actual_unfrozen == 0:
+        base.eval()
+        rank0_print("[INFO] backbone mode=frozen")
+    else:
+        rank0_print(f"[INFO] backbone mode=partial_unfreeze unfrozen_last_n_layers={actual_unfrozen}")
 
     if args.head_type == "single":
         head = ReadClassifierAttn(dim=256, num_classes=args.num_classes, dropout=0.1).to(device)
@@ -266,7 +285,16 @@ def main():
             data_paths, class2id, split_map, args.num_classes, device, path_class_map=path_class_map
         )
 
-    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    trainable_params = list(head.parameters()) + [p for p in base.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+
+    num_train_samples = sum(1 for sp in split_map.values() if sp == "train")
+    train_steps_per_epoch = max(1, (num_train_samples + max(args.batch_size, 1) - 1) // max(args.batch_size, 1))
+    total_train_steps = max(1, args.epochs * train_steps_per_epoch)
+    warmup_steps = int(total_train_steps * args.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(
+        opt, num_warmup_steps=warmup_steps, num_training_steps=total_train_steps
+    )
 
     wb = None
     if args.wandb:
@@ -292,6 +320,7 @@ def main():
             amp=args.amp,
             label_smoothing=args.label_smoothing,
             class_weight=class_weight,
+            scheduler=scheduler,
         )
 
         val_loss, val_top1, val_top5, cm, attn_stats = eval_one_epoch(
@@ -307,7 +336,7 @@ def main():
 
         dt = time.time() - t0
         rank0_print(
-            f"[E{epoch:03d}][freeze_base_{args.head_type}] "
+            f"[E{epoch:03d}][unfreeze{actual_unfrozen}_{args.head_type}] "
             f"train loss={tr_loss:.4f} top1={tr_top1:.4f} top5={tr_top5:.4f} | "
             f"val loss={val_loss:.4f} top1={val_top1:.4f} top5={val_top5:.4f} | time={dt:.1f}s"
         )
