@@ -27,6 +27,10 @@ def count_trainable_params(module: torch.nn.Module) -> int:
     return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
 
+def count_total_params(module: torch.nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
+
+
 def attn_stats_to_wandb(attn_stats: dict, prefix: str = "attn/") -> dict:
     if not attn_stats:
         return {}
@@ -274,14 +278,18 @@ def main():
     ).to(device)
 
     actual_unfrozen = configure_backbone_trainability(base, args.unfreeze_last_n_layers)
+    base_total = count_total_params(base)
     base_trainable = count_trainable_params(base)
     if actual_unfrozen == 0:
         base.eval()
-        rank0_print(f"[INFO] backbone mode=frozen trainable_params={base_trainable}")
+        rank0_print(
+            f"[INFO] backbone mode=frozen total_params={base_total} trainable_params={base_trainable}"
+        )
     else:
         rank0_print(
             f"[INFO] backbone mode=partial_unfreeze "
-            f"unfrozen_last_n_layers={actual_unfrozen} trainable_params={base_trainable}"
+            f"unfrozen_last_n_layers={actual_unfrozen} "
+            f"total_params={base_total} trainable_params={base_trainable}"
         )
 
     if args.head_type == "single":
@@ -295,7 +303,9 @@ def main():
             attn_dropout=args.gated_attn_dropout,
             temperature=args.gated_temperature,
         ).to(device)
-    rank0_print(f"[INFO] head trainable_params={count_trainable_params(head)}")
+    head_total = count_total_params(head)
+    head_trainable = count_trainable_params(head)
+    rank0_print(f"[INFO] head total_params={head_total} trainable_params={head_trainable}")
 
     class_weight = None
     if args.use_class_weight:
@@ -304,6 +314,9 @@ def main():
         )
 
     trainable_params = list(head.parameters()) + [p for p in base.parameters() if p.requires_grad]
+    rank0_print(
+        f"[INFO] optimizer total_trainable_params={base_trainable + head_trainable}"
+    )
     opt = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
 
     num_train_samples = sum(1 for sp in split_map.values() if sp == "train")
