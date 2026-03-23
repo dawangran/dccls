@@ -296,6 +296,14 @@ def main():
         opt, num_warmup_steps=warmup_steps, num_training_steps=total_train_steps
     )
 
+    num_train_samples = sum(1 for sp in split_map.values() if sp == "train")
+    train_steps_per_epoch = max(1, (num_train_samples + max(args.batch_size, 1) - 1) // max(args.batch_size, 1))
+    total_train_steps = max(1, args.epochs * train_steps_per_epoch)
+    warmup_steps = int(total_train_steps * args.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(
+        opt, num_warmup_steps=warmup_steps, num_training_steps=total_train_steps
+    )
+
     wb = None
     if args.wandb:
         import wandb
